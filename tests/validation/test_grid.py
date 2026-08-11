@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from heatsim.grid import Grid1D, face_diffusivity
+from heatsim.grid import Grid1D, harmonic_face_mean
 from heatsim.solvers import (
     explicit_step,
     crank_nicolson_step,
@@ -53,15 +53,16 @@ def test_steps_mutate_u_in_place(step):
     assert held_reference is grid.u
 
 
-def test_face_diffusivity_is_cached_and_invalidated():
+def test_face_conductivity_is_cached_and_invalidated():
     grid = Grid1D(LENGTH, 11, ALPHA)
-    first = grid.face_alpha
-    assert grid.face_alpha is first, "should be cached, not recomputed"
+    first = grid.face_k
+    assert grid.face_k is first, "should be cached, not recomputed"
 
-    grid.alpha[:] = ALPHA * 4
+    grid.k[:] = ALPHA * 4
     grid.invalidate_material()
 
-    assert grid.face_alpha == pytest.approx(ALPHA * 4)
+    assert grid.face_k == pytest.approx(ALPHA * 4)
+    assert grid.alpha == pytest.approx(ALPHA * 4)
 
 
 def test_changing_material_changes_crank_nicolson_result():
@@ -69,18 +70,18 @@ def test_changing_material_changes_crank_nicolson_result():
     crank_nicolson_step(baseline, 1e-4)
 
     grid = Grid1D(LENGTH, N, ALPHA, _asymmetric_profile())
-    crank_nicolson_step(grid, 1e-4)          # populates the cache
-    grid.u[:] = _asymmetric_profile()        # reset the field
-    grid.alpha[:] = ALPHA * 4
+    crank_nicolson_step(grid, 1e-4)
+    grid.u[:] = _asymmetric_profile()
+    grid.k[:] = ALPHA * 4
     grid.invalidate_material()
     crank_nicolson_step(grid, 1e-4)
 
     assert grid.u == pytest.approx(baseline.u, rel=1e-12)
 
 
-def test_face_diffusivity_handles_zero_conductivity():
+def test_harmonic_face_mean_handles_zero_conductivity():
     alpha = np.array([0.01, 0.0, 0.01])
-    faces = face_diffusivity(alpha)
+    faces = harmonic_face_mean(alpha)
 
     assert np.all(np.isfinite(faces))
     assert faces == pytest.approx(0.0)
@@ -105,10 +106,11 @@ def test_backwards_interval_is_rejected():
         run_explicit(grid, 0.10, 0.05)
 
 
-def test_passing_both_dt_and_safety_is_rejected():
+@pytest.mark.parametrize("safety", [0.1, 0.9])
+def test_passing_both_dt_and_safety_is_rejected(safety):
     grid = Grid1D(LENGTH, N, ALPHA, _asymmetric_profile())
     with pytest.raises(ValueError):
-        run_explicit(grid, 0.0, 0.01, safety=0.1, dt=1e-4)
+        run_explicit(grid, 0.0, 0.01, safety=safety, dt=1e-4)
 
 
 def test_crank_nicolson_requires_exactly_one_of_dt_or_n_steps():
@@ -121,18 +123,24 @@ def test_crank_nicolson_requires_exactly_one_of_dt_or_n_steps():
 
 def test_invalid_grid_arguments_are_rejected():
     with pytest.raises(ValueError):
-        Grid1D(LENGTH, 2, ALPHA)
+        Grid1D(LENGTH, 2, ALPHA) # too few points
     with pytest.raises(ValueError):
-        Grid1D(0.0, N, ALPHA)
+        Grid1D(0.0, N, ALPHA) # non-positive length
     with pytest.raises(ValueError):
-        Grid1D(LENGTH, N, -ALPHA)
+        Grid1D(LENGTH, N, -ALPHA) # negative conductivity
+    with pytest.raises(ValueError):
+        Grid1D(LENGTH, N) # no material given
+    with pytest.raises(ValueError):
+        Grid1D(LENGTH, N, ALPHA, k=ALPHA) # both forms at once
+    with pytest.raises(ValueError):
+        Grid1D(LENGTH, N, k=ALPHA, rho_c=0.0) # non-positive heat capacity
 
 
 def test_copy_is_independent():
     grid = Grid1D(LENGTH, N, ALPHA, _asymmetric_profile())
     clone = grid.copy()
     clone.u[:] = 0.0
-    clone.alpha[:] = 999.0
+    clone.k[:] = 999.0
 
     assert np.any(grid.u != 0.0)
-    assert grid.alpha == pytest.approx(ALPHA)
+    assert grid.k == pytest.approx(ALPHA)

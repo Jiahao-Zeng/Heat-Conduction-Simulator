@@ -47,11 +47,11 @@ def test_insulated_boundaries_conserve_heat():
     assert grid.total_heat() == pytest.approx(before, rel=1e-12)
 
 
-def test_uniform_material_has_uniform_face_diffusivity():
-    from heatsim.solvers import face_diffusivity
+def test_uniform_material_has_uniform_face_conductivity():
+    from heatsim.grid import harmonic_face_mean
 
     alpha = np.full(6, 0.01)
-    assert np.allclose(face_diffusivity(alpha), 0.01)
+    assert np.allclose(harmonic_face_mean(alpha), 0.01)
 
 
 @pytest.mark.parametrize("factor", [1.2, 1.5])
