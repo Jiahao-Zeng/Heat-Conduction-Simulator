@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from heatsim.grid import Grid1D, Grid2D
+from heatsim.boundary import Dirichlet, Neumann
 from heatsim.solvers import crank_nicolson_step, crank_nicolson_step_2d
 
 
@@ -51,7 +52,16 @@ def test_2d_cache_key_includes_boundary():
     grid = Grid2D(1.0, 1.0, 21, 21, 0.01, 1.0)
     crank_nicolson_step_2d(grid, 1e-4)
     key = next(iter(grid._solver_cache))
-    assert "dirichlet" in key
+    assert Dirichlet() in key
+
+
+def test_equivalent_boundary_spellings_share_one_cache_entry():
+    grid = Grid1D(1.0, 101, 0.01, np.linspace(0.0, 1.0, 101))
+    crank_nicolson_step(grid, 1e-4, boundary="neumann")
+    crank_nicolson_step(grid, 1e-4, boundary=Neumann())
+    crank_nicolson_step(grid, 1e-4, boundary=(Neumann(), Neumann()))
+
+    assert len(grid._solver_cache) == 1, list(grid._solver_cache)
 
 
 def test_invalidating_material_clears_the_solver_cache():
