@@ -1,12 +1,24 @@
 import numpy as np
 
 from heatsim.grid import harmonic_face_mean, face_diffusivity  # re-exported
+from heatsim.boundary import (Dirichlet, Neumann, Convective,
+                              normalize_boundary, uniform_boundary)
 
 _UNSET = object()
 
 
-def max_stable_dt(grid, safety=0.9):
-    return safety * grid.dx ** 2 / (2.0 * _max_diffusivity(grid))
+def max_stable_dt(grid, safety=0.9, boundary="dirichlet"):
+    dt = safety * grid.dx ** 2 / (2.0 * _max_diffusivity(grid))
+    left, right = normalize_boundary(boundary)
+    face_k = grid.face_k
+    sides = ((left, grid.rho_c[0], face_k[0]),
+             (right, grid.rho_c[-1], face_k[-1]))
+    for side, rho_c_b, k_face_b in sides:
+        if isinstance(side, Convective) and side.h > 0.0:
+            bound = (rho_c_b * grid.dx ** 2
+                     / (2.0 * k_face_b + side.h * grid.dx))
+            dt = min(dt, safety * bound)
+    return dt
 
 
 def _max_diffusivity(grid):
@@ -24,11 +36,12 @@ def _step_count(t_start, t_end, dt):
     return max(1, int(np.ceil((t_end - t_start) / dt)))
 
 
-def _explicit_plan(grid, t_start, t_end, dt, safety, max_dt_fn):
+def _explicit_plan(grid, t_start, t_end, dt, safety, max_dt_fn, boundary):
     if dt is not None and safety is not _UNSET:
         raise ValueError("pass either dt or safety, not both")
     if dt is None:
-        dt = max_dt_fn(grid, safety=0.9 if safety is _UNSET else safety)
+        dt = max_dt_fn(grid, safety=0.9 if safety is _UNSET else safety,
+                        boundary=boundary)
     n_steps = _step_count(t_start, t_end, dt)
     return n_steps, (t_end - t_start) / n_steps
 
@@ -49,29 +62,40 @@ def _march(grid, step, n_steps, dt_used, boundary):
     return grid, dt_used, n_steps
 
 
+def _explicit_boundary_term(bc, u_boundary):
+    if isinstance(bc, (Dirichlet, Neumann)):
+        return 0.0
+    if isinstance(bc, Convective):
+        return bc.h * (bc.u_inf - u_boundary)
+    raise TypeError(f"unsupported boundary condition: {bc!r}")
+
+
 def explicit_step(grid, dt, boundary="dirichlet"):
     u = grid.u
     dx = grid.dx
+    left, right = normalize_boundary(boundary)
 
     flux = grid.face_k * np.diff(u) / dx
 
-    if boundary == "neumann":
-        divergence = np.empty_like(u)
-        divergence[0] = flux[0]
-        divergence[1:-1] = np.diff(flux)
-        divergence[-1] = -flux[-1]
-        u += (dt / dx) * grid.inv_rho_c * divergence
-    elif boundary == "dirichlet":
-        u[1:-1] += (dt / dx) * grid.inv_rho_c[1:-1] * np.diff(flux)
-    else:
-        raise ValueError(f"unknown boundary condition: {boundary!r}")
+    divergence = np.empty_like(u)
+    divergence[1:-1] = np.diff(flux)
+    if not isinstance(left, Dirichlet):
+        divergence[0] = flux[0] + _explicit_boundary_term(left, u[0])
+    if not isinstance(right, Dirichlet):
+        divergence[-1] = -flux[-1] + _explicit_boundary_term(right, u[-1])
+
+    u[1:-1] += (dt / dx) * grid.inv_rho_c[1:-1] * divergence[1:-1]
+    if not isinstance(left, Dirichlet):
+        u[0] += (dt / (dx * grid.cell_weight[0])) * grid.inv_rho_c[0] * divergence[0]
+    if not isinstance(right, Dirichlet):
+        u[-1] += (dt / (dx * grid.cell_weight[-1])) * grid.inv_rho_c[-1] * divergence[-1]
 
     return u
 
 
 def run_explicit(grid, t_start, t_end, safety=_UNSET, boundary="dirichlet", dt=None):
     n_steps, dt_used = _explicit_plan(
-        grid, t_start, t_end, dt, safety, max_stable_dt)
+        grid, t_start, t_end, dt, safety, max_stable_dt, boundary)
     return _march(grid, explicit_step, n_steps, dt_used, boundary)
 
 
@@ -161,32 +185,36 @@ def _tridiagonal_from_rates(r_left, r_right):
     return sub, diag, sup
 
 
-def _crank_nicolson_rates(grid, dt, boundary):
+def _crank_nicolson_rates(grid, dt, bc):
     scale = dt / (2.0 * grid.dx ** 2)
     face = grid.face_k
 
-    if boundary == "dirichlet":
+    if isinstance(bc, Dirichlet):
         inv_rho_c = grid.inv_rho_c[1:-1]
         return scale * face[:-1] * inv_rho_c, scale * face[1:] * inv_rho_c
-    if boundary == "neumann":
+    if isinstance(bc, Neumann):
         padded = np.concatenate(([0.0], face, [0.0]))
-        inv_rho_c = grid.inv_rho_c
+        inv_rho_c = grid.inv_rho_c / grid.cell_weight
         return scale * padded[:-1] * inv_rho_c, scale * padded[1:] * inv_rho_c
-    raise ValueError(f"unknown boundary condition: {boundary!r}")
+    raise ValueError(
+        f"crank_nicolson_step does not support {bc!r} yet")
 
 
 def crank_nicolson_step(grid, dt, boundary="dirichlet"):
     u = grid.u
+    bc = uniform_boundary(boundary, "crank_nicolson_step")
+    if not isinstance(bc, (Dirichlet, Neumann)):
+        raise ValueError(f"crank_nicolson_step does not support {bc!r} yet")
 
-    key = ("cn1d", float(dt), boundary)
+    key = ("cn1d", float(dt), bc)
     cached = grid._solver_cache.get(key)
     if cached is None:
-        r_left, r_right = _crank_nicolson_rates(grid, dt, boundary)
+        r_left, r_right = _crank_nicolson_rates(grid, dt, bc)
         factors = tridiagonal_factor(*_tridiagonal_from_rates(r_left, r_right))
         cached = grid._cache_solver(key, (factors, r_left, r_right))
     factors, r_left, r_right = cached
 
-    if boundary == "dirichlet":
+    if isinstance(bc, Dirichlet):
         rhs = (r_left * u[0:-2]
                + (1.0 - r_left - r_right) * u[1:-1]
                + r_right * u[2:])
@@ -208,7 +236,8 @@ def run_crank_nicolson(grid, t_start, t_end, boundary="dirichlet",
     return _march(grid, crank_nicolson_step, n_steps, dt_used, boundary)
 
 
-def max_stable_dt_2d(grid, safety=0.9):
+def max_stable_dt_2d(grid, safety=0.9, boundary="dirichlet"):
+    normalize_boundary(boundary)
     return safety / (2.0 * _max_diffusivity(grid)
                      * (1.0 / grid.dx ** 2 + 1.0 / grid.dy ** 2))
 
@@ -222,20 +251,23 @@ def _axis_divergence(face_k, u, spacing, axis):
 def explicit_step_2d(grid, dt, boundary="dirichlet"):
     u = grid.u
     dx, dy = grid.dx, grid.dy
+    bc = uniform_boundary(boundary, "explicit_step_2d")
 
-    if boundary == "dirichlet":
+    if isinstance(bc, Dirichlet):
         div_x = _axis_divergence(grid.face_k_x, u, dx, axis=0)
         div_y = _axis_divergence(grid.face_k_y, u, dy, axis=1)
         u[1:-1, 1:-1] += (dt * grid.inv_rho_c[1:-1, 1:-1]
                           * (div_x[:, 1:-1] + div_y[1:-1, :]))
-    elif boundary == "neumann":
+    elif isinstance(bc, Neumann):
         flux_x = grid.face_k_x * np.diff(u, axis=0) / dx
         flux_y = grid.face_k_y * np.diff(u, axis=1) / dy
-        div = (np.diff(np.pad(flux_x, ((1, 1), (0, 0))), axis=0) / dx
-               + np.diff(np.pad(flux_y, ((0, 0), (1, 1))), axis=1) / dy)
+        div = (np.diff(np.pad(flux_x, ((1, 1), (0, 0))), axis=0)
+               / (dx * grid.cell_weight_x)
+               + np.diff(np.pad(flux_y, ((0, 0), (1, 1))), axis=1)
+               / (dy * grid.cell_weight_y))
         u += dt * grid.inv_rho_c * div
     else:
-        raise ValueError(f"unknown boundary condition: {boundary!r}")
+        raise ValueError(f"explicit_step_2d does not support {bc!r} yet")
 
     return u
 
@@ -243,7 +275,7 @@ def explicit_step_2d(grid, dt, boundary="dirichlet"):
 def run_explicit_2d(grid, t_start, t_end, safety=_UNSET,
                     boundary="dirichlet", dt=None):
     n_steps, dt_used = _explicit_plan(
-        grid, t_start, t_end, dt, safety, max_stable_dt_2d)
+        grid, t_start, t_end, dt, safety, max_stable_dt_2d, boundary)
     return _march(grid, explicit_step_2d, n_steps, dt_used, boundary)
 
 
@@ -254,16 +286,17 @@ def _adi_rates(face_k_along, inv_rho_c_interior, dt_half, spacing):
 
 
 def crank_nicolson_step_2d(grid, dt, boundary="dirichlet"):
-    if boundary != "dirichlet":
+    bc = uniform_boundary(boundary, "crank_nicolson_step_2d")
+    if not isinstance(bc, Dirichlet):
         raise ValueError(
-            f"crank_nicolson_step_2d only supports boundary='dirichlet' "
-            f"(got {boundary!r})")
+            f"crank_nicolson_step_2d only supports Dirichlet boundaries "
+            f"(got {bc!r})")
 
     u = grid.u
     dx, dy = grid.dx, grid.dy
     dt_half = dt / 2.0
 
-    key = ("cn2d", float(dt), boundary)
+    key = ("cn2d", float(dt), bc)
     cached = grid._solver_cache.get(key)
     if cached is None:
         inv_rho_c_int = grid.inv_rho_c[1:-1, 1:-1]
