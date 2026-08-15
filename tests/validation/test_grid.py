@@ -144,3 +144,35 @@ def test_copy_is_independent():
 
     assert np.any(grid.u != 0.0)
     assert grid.k == pytest.approx(ALPHA)
+
+def _neumann_orders(step_runner):
+    length, alpha, k_val, t_end = 1.0, 1.0e-2, 0.6, 5.0
+    kappa = np.pi / length
+    errors = []
+    for n in [51, 101, 201, 401]:
+        xs = np.linspace(0.0, length, n)
+        grid = Grid1D(length, n, initial_temperature=np.cos(kappa * xs),
+                      k=k_val, rho_c=k_val / alpha)
+        step_runner(grid, t_end)
+        exact = np.cos(kappa * xs) * np.exp(-alpha * kappa ** 2 * t_end)
+        errors.append(np.sqrt(np.mean((grid.u - exact) ** 2)))
+    return [np.log2(errors[i] / errors[i + 1]) for i in range(len(errors) - 1)]
+
+
+def test_explicit_neumann_boundary_is_second_order_accurate():
+    orders = _neumann_orders(
+        lambda g, t_end: run_explicit(g, 0.0, t_end, safety=0.9,
+                                      boundary="neumann"))
+    assert all(o > 1.85 for o in orders), orders
+
+
+def test_crank_nicolson_neumann_boundary_is_second_order_accurate():
+    orders = _neumann_orders(
+        lambda g, t_end: run_crank_nicolson(g, 0.0, t_end,
+                                            boundary="neumann", n_steps=4000))
+    assert all(o > 1.85 for o in orders), orders
+
+
+def test_total_heat_uses_half_size_boundary_control_volumes():
+    grid = Grid1D(1.0, 5, initial_temperature=1.0, k=1.0, rho_c=1.0)
+    assert grid.total_heat() == pytest.approx(1.0)
