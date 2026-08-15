@@ -54,6 +54,9 @@ class _MaterialCacheMixin:
         self._face_k = None
         self._face_k_x = None
         self._face_k_y = None
+        self._cell_weight = None
+        self._cell_weight_x = None
+        self._cell_weight_y = None
         self._solver_cache = {}
 
     def invalidate_material(self):
@@ -106,12 +109,21 @@ class Grid1D(_MaterialCacheMixin):
             self._face_k = harmonic_face_mean(self.k)
         return self._face_k
 
+    @property
+    def cell_weight(self):
+        if self._cell_weight is None:
+            w = np.ones(self.n_points)
+            w[0] = w[-1] = 0.5
+            self._cell_weight = w
+        return self._cell_weight
+
     def copy(self):
         return Grid1D(self.length, self.n_points, initial_temperature=self.u,
                       k=self.k, rho_c=self.rho_c)
 
     def total_heat(self):
-        return float(np.sum(self.rho_c * self.u) * self.dx)
+        return float(
+            np.sum(self.cell_weight * self.rho_c * self.u) * self.dx)
 
 
 class Grid2D(_MaterialCacheMixin):
@@ -137,6 +149,7 @@ class Grid2D(_MaterialCacheMixin):
 
         self.k, self.rho_c = _material_fields(
             alpha, k, rho_c, (self.nx, self.ny))
+
         self.k_y = (_conductivity_field(k_y, (self.nx, self.ny))
                     if k_y is not None else self.k)
 
@@ -148,6 +161,7 @@ class Grid2D(_MaterialCacheMixin):
 
     @property
     def alpha(self):
+
         if self._alpha is None:
             self._alpha = np.maximum(self.k / self.rho_c, self.k_y / self.rho_c)
         return self._alpha
@@ -168,11 +182,30 @@ class Grid2D(_MaterialCacheMixin):
     def is_anisotropic(self):
         return self.k_y is not self.k
 
+    @property
+    def cell_weight_x(self):
+        if self._cell_weight_x is None:
+            w = np.ones((self.nx, 1))
+            w[0, 0] = w[-1, 0] = 0.5
+            self._cell_weight_x = w
+        return self._cell_weight_x
+
+    @property
+    def cell_weight_y(self):
+        if self._cell_weight_y is None:
+            w = np.ones((1, self.ny))
+            w[0, 0] = w[0, -1] = 0.5
+            self._cell_weight_y = w
+        return self._cell_weight_y
+
     def copy(self):
+
         return Grid2D(self.length_x, self.length_y, self.nx, self.ny,
                       initial_temperature=self.u, k=self.k,
                       k_y=self.k_y if self.is_anisotropic else None,
                       rho_c=self.rho_c)
 
     def total_heat(self):
-        return float(np.sum(self.rho_c * self.u) * self.dx * self.dy)
+        weight = self.cell_weight_x * self.cell_weight_y
+        return float(np.sum(weight * self.rho_c * self.u)
+                     * self.dx * self.dy)
