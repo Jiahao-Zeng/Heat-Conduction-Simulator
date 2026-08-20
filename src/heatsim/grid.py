@@ -21,6 +21,8 @@ face_diffusivity = harmonic_face_mean
 
 def _conductivity_field(value, shape):
     field = np.broadcast_to(np.asarray(value, dtype=float), shape).copy()
+    if not np.all(np.isfinite(field)):
+        raise ValueError("conductivity must be finite")
     if np.any(field < 0.0):
         raise ValueError("conductivity must be non-negative")
     return field
@@ -40,6 +42,8 @@ def _material_fields(alpha, k, rho_c, shape):
         k_field = _conductivity_field(k, shape)
         rho_c_field = np.broadcast_to(np.asarray(rho_c, dtype=float), shape).copy()
 
+    if not np.all(np.isfinite(rho_c_field)):
+        raise ValueError("volumetric heat capacity must be finite")
     if np.any(rho_c_field <= 0.0):
         raise ValueError("volumetric heat capacity must be positive")
     return k_field, rho_c_field
@@ -86,8 +90,8 @@ class Grid1D(_MaterialCacheMixin):
     def __init__(self, length, n_points, alpha=None, initial_temperature=0.0, k=None, rho_c=None):
         if n_points < 3:
             raise ValueError("n_points must be at least 3")
-        if length <= 0.0:
-            raise ValueError("length must be positive")
+        if not np.isfinite(length) or length <= 0.0:
+            raise ValueError("length must be positive and finite")
 
         self.length = float(length)
         self.n_points = int(n_points)
@@ -131,6 +135,8 @@ class Grid2D(_MaterialCacheMixin):
                  initial_temperature=0.0, k=None, rho_c=None, k_y=None):
         if nx < 3 or ny < 3:
             raise ValueError("nx and ny must each be at least 3")
+        if not (np.isfinite(length_x) and np.isfinite(length_y)):
+            raise ValueError("length_x and length_y must be finite")
         if length_x <= 0.0 or length_y <= 0.0:
             raise ValueError("length_x and length_y must be positive")
         if k_y is not None and alpha is not None:
