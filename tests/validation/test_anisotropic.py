@@ -152,3 +152,24 @@ def test_k_y_cannot_be_combined_with_alpha():
 def test_negative_k_y_is_rejected():
     with pytest.raises(ValueError):
         Grid2D(LENGTH, LENGTH, 11, 11, k=0.01, k_y=-1.0, rho_c=1.0)
+
+
+def test_insulated_boundaries_with_anisotropic_conductivity():
+    nx, ny = 41, 67
+    lx, ly = 1.0, 0.6
+    alpha_x, alpha_y, t_end = 2.0e-2, 5.0e-3, 0.5
+    xs = np.linspace(0.0, lx, nx)
+    ys = np.linspace(0.0, ly, ny)
+    X, Y = np.meshgrid(xs, ys, indexing="ij")
+
+    kx, ky = np.pi / lx, 2.0 * np.pi / ly
+    decay = alpha_x * kx ** 2 + alpha_y * ky ** 2
+    u0 = np.cos(kx * X) * np.cos(ky * Y)
+
+    grid = Grid2D(lx, ly, nx, ny, initial_temperature=u0,
+                  k=alpha_x, k_y=alpha_y, rho_c=1.0)
+    run_explicit_2d(grid, 0.0, t_end, safety=0.9, boundary="neumann")
+
+    exact = u0 * np.exp(-decay * t_end)
+    rel = np.sqrt(np.mean((grid.u - exact) ** 2)) / np.max(np.abs(exact))
+    assert rel < 1e-2

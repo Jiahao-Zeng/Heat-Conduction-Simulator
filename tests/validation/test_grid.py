@@ -29,7 +29,7 @@ def test_total_heat_is_conserved_with_asymmetric_profile():
     for _ in range(20_000):
         explicit_step(grid, dt, boundary="neumann")
 
-    assert grid.u[0] != pytest.approx(_asymmetric_profile()[0], rel=1e-3), \
+    assert grid.u[0] != pytest.approx(_asymmetric_profile()[0], rel=1e-3),\
         "endpoints should have moved, or this test proves nothing"
     assert grid.total_heat() == pytest.approx(before, rel=1e-10)
 
@@ -123,17 +123,17 @@ def test_crank_nicolson_requires_exactly_one_of_dt_or_n_steps():
 
 def test_invalid_grid_arguments_are_rejected():
     with pytest.raises(ValueError):
-        Grid1D(LENGTH, 2, ALPHA) # too few points
+        Grid1D(LENGTH, 2, ALPHA)
     with pytest.raises(ValueError):
-        Grid1D(0.0, N, ALPHA) # non-positive length
+        Grid1D(0.0, N, ALPHA)
     with pytest.raises(ValueError):
-        Grid1D(LENGTH, N, -ALPHA) # negative conductivity
+        Grid1D(LENGTH, N, -ALPHA)
     with pytest.raises(ValueError):
-        Grid1D(LENGTH, N) # no material given
+        Grid1D(LENGTH, N)
     with pytest.raises(ValueError):
-        Grid1D(LENGTH, N, ALPHA, k=ALPHA) # both forms at once
+        Grid1D(LENGTH, N, ALPHA, k=ALPHA)
     with pytest.raises(ValueError):
-        Grid1D(LENGTH, N, k=ALPHA, rho_c=0.0) # non-positive heat capacity
+        Grid1D(LENGTH, N, k=ALPHA, rho_c=0.0)
 
 
 def test_copy_is_independent():
@@ -176,3 +176,28 @@ def test_crank_nicolson_neumann_boundary_is_second_order_accurate():
 def test_total_heat_uses_half_size_boundary_control_volumes():
     grid = Grid1D(1.0, 5, initial_temperature=1.0, k=1.0, rho_c=1.0)
     assert grid.total_heat() == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_material_properties_are_rejected(bad):
+    with pytest.raises(ValueError):
+        Grid1D(1.0, 11, k=bad, rho_c=1.0)
+    with pytest.raises(ValueError):
+        Grid1D(1.0, 11, k=1.0, rho_c=bad)
+    with pytest.raises(ValueError):
+        Grid1D(1.0, 11, alpha=bad)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_non_finite_geometry_is_rejected(bad):
+    with pytest.raises(ValueError):
+        Grid1D(bad, 11, alpha=0.1)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_non_finite_2d_material_and_geometry_are_rejected(bad):
+    from heatsim.grid import Grid2D
+    with pytest.raises(ValueError):
+        Grid2D(1.0, 1.0, 5, 5, k=1.0, k_y=bad, rho_c=1.0)
+    with pytest.raises(ValueError):
+        Grid2D(1.0, bad, 5, 5, alpha=0.1)

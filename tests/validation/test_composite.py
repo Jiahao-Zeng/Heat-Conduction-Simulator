@@ -7,10 +7,10 @@ from heatsim.solvers import (
     run_crank_nicolson,
     explicit_step,
     explicit_step_2d,
+    crank_nicolson_step,
     max_stable_dt,
     max_stable_dt_2d,
 )
-
 
 LENGTH = 1.0
 N = 101
@@ -120,3 +120,58 @@ def test_2d_composite_reduces_to_the_1d_solver():
 
     assert two_d.u[:, 0] == pytest.approx(one_d.u, abs=1e-12)
     assert np.max(np.abs(two_d.u - two_d.u[:, :1])) == 0.0
+
+
+LAYER_K1, LAYER_K2 = 0.5, 8.0
+LAYER_INTERFACE = 0.4
+LAYER_T0, LAYER_TL = 0.0, 100.0
+LAYER_LENGTH = 1.0
+
+
+def _layered_steady_profile(xs, interface):
+    flux = (LAYER_TL - LAYER_T0) / (interface / LAYER_K1
+                                    + (LAYER_LENGTH - interface) / LAYER_K2)
+    return np.where(
+        xs < interface,
+        LAYER_T0 + flux * xs / LAYER_K1,
+        LAYER_T0 + flux * interface / LAYER_K1
+        + flux * (xs - interface) / LAYER_K2)
+
+
+def _layered_grid(n):
+    xs = np.linspace(0.0, LAYER_LENGTH, n)
+    dx = LAYER_LENGTH / (n - 1)
+    conductivity = np.where(xs < LAYER_INTERFACE, LAYER_K1, LAYER_K2)
+
+    profile = _layered_steady_profile(xs, LAYER_INTERFACE - dx / 2.0)
+    grid = Grid1D(LAYER_LENGTH, n, initial_temperature=profile.copy(),
+                  k=conductivity, rho_c=np.full(n, 1e3))
+    return grid, profile
+
+
+@pytest.mark.parametrize("n", [101, 201, 401])
+def test_two_layer_steady_state_is_a_discrete_fixed_point(n):
+    grid, profile = _layered_grid(n)
+
+    for _ in range(200):
+        crank_nicolson_step(grid, 1.0, boundary="dirichlet")
+
+    assert np.abs(grid.u - profile).max() < 1e-8
+
+
+def test_two_layer_steady_state_is_a_fixed_point_for_the_explicit_solver():
+    grid, profile = _layered_grid(201)
+    dt = max_stable_dt(grid, safety=0.9)
+
+    for _ in range(5000):
+        explicit_step(grid, dt, boundary="dirichlet")
+
+    assert np.abs(grid.u - profile).max() < 1e-9
+
+
+def test_heat_flux_is_continuous_across_a_material_interface():
+    grid, _ = _layered_grid(201)
+
+    flux = grid.face_k * np.diff(grid.u) / grid.dx
+
+    assert flux.max() - flux.min() < 1e-8 * abs(flux.mean())
