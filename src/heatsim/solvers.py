@@ -185,6 +185,73 @@ def _tridiagonal_from_rates(r_left, r_right):
     return sub, diag, sup
 
 
+def max_monotone_dt(grid, boundary="dirichlet", safety=0.9):
+    left, right = normalize_boundary(boundary)
+    face_k = grid.face_k
+    dx2 = grid.dx ** 2
+
+    interior = np.min(grid.rho_c[1:-1] / (face_k[:-1] + face_k[1:]))
+    dt = interior * dx2
+
+    sides = ((left, grid.rho_c[0], face_k[0]),
+             (right, grid.rho_c[-1], face_k[-1]))
+    for side, rho_c_b, k_face_b in sides:
+        if isinstance(side, Dirichlet):
+            continue
+        h = side.h if isinstance(side, Convective) else 0.0
+        dt = min(dt, rho_c_b * dx2 / (2.0 * (k_face_b + h * grid.dx)))
+
+    return safety * dt
+
+
+def _crank_nicolson_general_rates(grid, dt, left, right):
+    for side in (left, right):
+        if not isinstance(side, (Dirichlet, Neumann, Convective)):
+            raise TypeError(f"unsupported boundary condition: {side!r}")
+
+    scale = dt / (2.0 * grid.dx ** 2)
+    padded = np.concatenate(([0.0], grid.face_k, [0.0]))
+    inv_rho_c = grid.inv_rho_c / grid.cell_weight
+
+    r_left = scale * padded[:-1] * inv_rho_c
+    r_right = scale * padded[1:] * inv_rho_c
+    forcing = np.zeros_like(r_left)
+
+    if isinstance(left, Convective):
+        r_left[0] = scale * left.h * grid.dx * inv_rho_c[0]
+        forcing[0] = 2.0 * r_left[0] * left.u_inf
+    elif isinstance(left, Dirichlet):
+        r_left[0] = 0.0
+        r_right[0] = 0.0
+
+    if isinstance(right, Convective):
+        r_right[-1] = scale * right.h * grid.dx * inv_rho_c[-1]
+        forcing[-1] = 2.0 * r_right[-1] * right.u_inf
+    elif isinstance(right, Dirichlet):
+        r_left[-1] = 0.0
+        r_right[-1] = 0.0
+
+    return r_left, r_right, forcing
+
+
+def _crank_nicolson_general_step(grid, dt, sides):
+    u = grid.u
+    key = ("cn1d-general", float(dt), sides)
+    cached = grid._solver_cache.get(key)
+    if cached is None:
+        r_left, r_right, forcing = _crank_nicolson_general_rates(
+            grid, dt, *sides)
+        factors = tridiagonal_factor(*_tridiagonal_from_rates(r_left, r_right))
+        cached = grid._cache_solver(key, (factors, r_left, r_right, forcing))
+    factors, r_left, r_right, forcing = cached
+
+    rhs = (1.0 - r_left - r_right) * u + forcing
+    rhs[1:] += r_left[1:] * u[:-1]
+    rhs[:-1] += r_right[:-1] * u[1:]
+    u[:] = tridiagonal_solve(factors, rhs)
+    return u
+
+
 def _crank_nicolson_rates(grid, dt, bc):
     scale = dt / (2.0 * grid.dx ** 2)
     face = grid.face_k
@@ -202,7 +269,12 @@ def _crank_nicolson_rates(grid, dt, bc):
 
 def crank_nicolson_step(grid, dt, boundary="dirichlet"):
     u = grid.u
-    bc = uniform_boundary(boundary, "crank_nicolson_step")
+    left, right = normalize_boundary(boundary)
+
+    if left != right or isinstance(left, Convective):
+        return _crank_nicolson_general_step(grid, dt, (left, right))
+
+    bc = left
     if not isinstance(bc, (Dirichlet, Neumann)):
         raise ValueError(f"crank_nicolson_step does not support {bc!r} yet")
 
