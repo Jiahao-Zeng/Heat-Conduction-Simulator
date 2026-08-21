@@ -7,7 +7,9 @@ from heatsim.grid import Grid1D, Grid2D
 from heatsim.boundary import Dirichlet, Neumann, Convective
 from heatsim.solvers import (explicit_step, run_explicit, max_stable_dt,
                              crank_nicolson_step, run_crank_nicolson,
-                             explicit_step_2d, crank_nicolson_step_2d,
+                             explicit_step_2d, run_explicit_2d,
+                             run_crank_nicolson_2d,
+                             crank_nicolson_step_2d, max_stable_dt_2d,
                              max_monotone_dt, _crank_nicolson_general_step)
 from heatsim.analytical import semi_infinite_convective
 
@@ -181,22 +183,29 @@ def test_crank_nicolson_2d_accepts_the_dirichlet_object():
     assert np.array_equal(g_str.u, g_obj.u)
 
 
-def test_solvers_without_convective_support_say_so_clearly():
+def test_crank_nicolson_2d_accepts_all_supported_boundary_types():
     g2 = Grid2D(1.0, 1.0, 21, 21, initial_temperature=1.0, k=K, rho_c=K / ALPHA)
-    conv = Convective(h=10.0, u_inf=T_INF)
 
-    with pytest.raises(ValueError, match="does not support"):
-        explicit_step_2d(g2, 1e-3, boundary=conv)
-    with pytest.raises(ValueError, match="only supports Dirichlet"):
-        crank_nicolson_step_2d(g2, 1e-3, boundary=conv)
+    for bc in (Dirichlet(), Neumann(), Convective(h=10.0, u_inf=T_INF)):
+        crank_nicolson_step_2d(g2, 1e-3, boundary=bc)
+
+    crank_nicolson_step_2d(
+        g2, 1e-3, boundary=((Convective(h=10.0, u_inf=T_INF), Dirichlet()),
+                            Neumann()))
 
 
-def test_uniform_only_solvers_reject_asymmetric_boundaries():
+def test_explicit_2d_per_axis_boundary_spec_applies_x_and_y_independently():
     g2 = Grid2D(1.0, 1.0, 21, 21, initial_temperature=1.0, k=K, rho_c=K / ALPHA)
     mixed = (Dirichlet(), Neumann())
 
-    with pytest.raises(ValueError, match="both sides"):
-        explicit_step_2d(g2, 1e-3, boundary=mixed)
+    explicit_step_2d(g2, 1e-3, boundary=mixed)
+
+
+def test_explicit_2d_rejects_a_malformed_boundary_spec():
+    g2 = Grid2D(1.0, 1.0, 21, 21, initial_temperature=1.0, k=K, rho_c=K / ALPHA)
+
+    with pytest.raises(ValueError):
+        explicit_step_2d(g2, 1e-3, boundary=(Dirichlet(), Neumann(), Dirichlet()))
 
 
 def test_negative_h_is_rejected():
@@ -491,3 +500,232 @@ def test_convective_skin_would_diverge_on_the_interior_material_bound():
         / (2.0 * grid.face_k[1] + h * grid.dx))
 
     assert correct < interior_based
+
+LX_2D_STRIP, LY_2D_STRIP = 0.2, 0.37
+
+
+def _2d_strip_grid(nx, ny, lx=LX_2D_STRIP, ly=LY_2D_STRIP):
+    u0 = np.full((nx, ny), T_I)
+    return Grid2D(lx, ly, nx, ny, initial_temperature=u0, k=K, rho_c=K / ALPHA)
+
+
+def test_2d_explicit_x_convective_reduces_to_1d_on_every_row():
+    nx, ny = 401, 37
+    grid = _2d_strip_grid(nx, ny)
+    xs = np.linspace(0.0, LX_2D_STRIP, nx)
+    boundary = ((Convective(h=H, u_inf=T_INF), Dirichlet()), Neumann())
+
+    run_explicit_2d(grid, 0.0, T_END, safety=0.9, boundary=boundary)
+
+    exact = _exact(xs, T_END)
+    per_row_err = np.abs(grid.u - exact[:, None]).max(axis=0)
+    assert per_row_err.max() < 1e-3
+    assert np.array_equal(grid.u, grid.u[:, [0]] * np.ones((1, ny)))
+
+
+def test_2d_explicit_y_convective_reduces_to_1d_on_every_column():
+    nx, ny = 37, 401
+    lx, ly = LY_2D_STRIP, LX_2D_STRIP
+    grid = Grid2D(lx, ly, nx, ny, initial_temperature=np.full((nx, ny), T_I),
+                 k=K, rho_c=K / ALPHA)
+    ys = np.linspace(0.0, ly, ny)
+    boundary = (Neumann(), (Convective(h=H, u_inf=T_INF), Dirichlet()))
+
+    run_explicit_2d(grid, 0.0, T_END, safety=0.9, boundary=boundary)
+
+    exact = _exact(ys, T_END)
+    per_col_err = np.abs(grid.u - exact[None, :]).max(axis=1)
+    assert per_col_err.max() < 1e-3
+    assert np.array_equal(grid.u, grid.u[[0], :] * np.ones((nx, 1)))
+
+
+def test_2d_explicit_convective_is_second_order_accurate():
+    errors = []
+    for scale in (1, 2, 4):
+        nx, ny = 100 * scale + 1, 18 * scale + 1
+        xs = np.linspace(0.0, LX_2D_STRIP, nx)
+        grid = _2d_strip_grid(nx, ny)
+        run_explicit_2d(grid, 0.0, T_END, safety=0.9,
+                       boundary=((Convective(h=H, u_inf=T_INF), Dirichlet()),
+                                "neumann"))
+        exact = _exact(xs, T_END)
+        errors.append(np.sqrt(np.mean((grid.u - exact[:, None]) ** 2)))
+
+    orders = _convergence_orders(errors)
+    assert all(o > 1.85 for o in orders), orders
+
+
+def test_2d_convective_on_all_sides_reaches_the_common_u_inf():
+    n = 51
+    boundary = (Convective(h=50.0, u_inf=T_INF), Convective(h=50.0, u_inf=T_INF))
+    grid = Grid2D(0.2, 0.15, n, n, initial_temperature=np.full((n, n), T_I),
+                 k=K, rho_c=K / ALPHA)
+
+    run_explicit_2d(grid, 0.0, 1.0e5, safety=0.9, boundary=boundary)
+
+    assert grid.u == pytest.approx(T_INF, abs=1e-3)
+
+
+@pytest.mark.parametrize("h", [0.0, 1e1, 1e2, 1e3, 1e4])
+def test_2d_explicit_convective_stays_bounded_across_h(h):
+    n = 21
+    boundary = ((Convective(h=h, u_inf=T_INF), Dirichlet()),
+               (Convective(h=h, u_inf=T_INF), Dirichlet()))
+    grid = Grid2D(0.2, 0.15, n, n, initial_temperature=np.full((n, n), T_I),
+                 k=K, rho_c=K / ALPHA)
+
+    run_explicit_2d(grid, 0.0, 5.0, safety=0.9, boundary=boundary)
+
+    assert np.all(np.isfinite(grid.u))
+    assert grid.u.max() <= T_INF + 1e-6
+    assert grid.u.min() >= T_I - 1e-6
+
+
+def test_2d_boundary_local_material_governs_the_2d_timestep():
+    n = 21
+    k = np.full((n, n), 20.0)
+    k[0, :] = 0.05
+    rho_c = np.full((n, n), 1.0e6)
+    rho_c[0, :] = 1.0e3
+    grid = Grid2D(0.2, 0.2, n, n, initial_temperature=np.zeros((n, n)),
+                 k=k, rho_c=rho_c)
+    boundary = ((Convective(h=1e3, u_inf=0.0), Dirichlet()), Neumann())
+
+    dt = max_stable_dt_2d(grid, safety=0.9, boundary=boundary)
+    run_explicit_2d(grid, 0.0, 400.0 * dt, boundary=boundary, dt=dt)
+
+    assert np.all(np.isfinite(grid.u))
+
+
+def test_2d_explicit_x_convective_matches_1d_with_anisotropic_material():
+    ax, ay, h = 0.02, 0.005, 15.0
+    nx, ny = 201, 23
+    lx, ly = 0.2, 0.37
+    ti, tinf = 20.0, 100.0
+    xs = np.linspace(0.0, lx, nx)
+    grid = Grid2D(lx, ly, nx, ny, initial_temperature=np.full((nx, ny), ti),
+                 k=ax, k_y=ay, rho_c=1.0)
+    boundary = ((Convective(h=h, u_inf=tinf), Dirichlet()), Neumann())
+
+    run_explicit_2d(grid, 0.0, 0.05, safety=0.9, boundary=boundary)
+
+    exact = semi_infinite_convective(xs, 0.05, ax, h, ax, ti, tinf)
+    per_row_err = np.abs(grid.u - exact[:, None]).max(axis=0)
+    assert per_row_err.max() < 1e-2
+
+
+@pytest.mark.parametrize("axis", ["x", "y"])
+def test_2d_convective_is_mirror_symmetric(axis):
+    nx, ny = 121, 17
+    conv = Convective(h=H, u_inf=T_INF)
+
+    def run(bc):
+        if axis == "x":
+            grid = Grid2D(LX_2D_STRIP, LY_2D_STRIP, nx, ny,
+                         initial_temperature=np.full((nx, ny), T_I),
+                         k=K, rho_c=K / ALPHA)
+        else:
+            grid = Grid2D(LY_2D_STRIP, LX_2D_STRIP, ny, nx,
+                         initial_temperature=np.full((ny, nx), T_I),
+                         k=K, rho_c=K / ALPHA)
+        run_explicit_2d(grid, 0.0, T_END, safety=0.9, boundary=bc)
+        return grid.u.copy()
+
+    if axis == "x":
+        lo = run(((conv, Dirichlet()), Neumann()))
+        hi = run(((Dirichlet(), conv), Neumann()))
+        assert np.allclose(lo, hi[::-1, :], rtol=0, atol=1e-9)
+    else:
+        lo = run((Neumann(), (conv, Dirichlet())))
+        hi = run((Neumann(), (Dirichlet(), conv)))
+        assert np.allclose(lo, hi[:, ::-1], rtol=0, atol=1e-9)
+
+
+@pytest.mark.parametrize("h", [1e2, 1e3, 1e4])
+def test_2d_convective_on_the_hi_faces_is_stable(h):
+    n = 21
+    boundary = ((Dirichlet(), Convective(h=h, u_inf=T_INF)),
+               (Dirichlet(), Convective(h=h, u_inf=T_INF)))
+    grid = Grid2D(0.2, 0.15, n, n, initial_temperature=np.full((n, n), T_I),
+                 k=K, rho_c=K / ALPHA)
+
+    run_explicit_2d(grid, 0.0, 5.0, safety=0.9, boundary=boundary)
+
+    assert np.all(np.isfinite(grid.u))
+    assert grid.u.max() <= T_INF + 1e-6
+    assert grid.u.min() >= T_I - 1e-6
+
+
+def test_2d_crank_nicolson_x_convective_reduces_to_1d_on_every_row():
+    nx, ny = 401, 23
+    grid = _2d_strip_grid(nx, ny)
+    xs = np.linspace(0.0, LX_2D_STRIP, nx)
+    boundary = ((Convective(h=H, u_inf=T_INF), Dirichlet()), Neumann())
+
+    run_crank_nicolson_2d(grid, 0.0, T_END, boundary=boundary, n_steps=8000)
+
+    exact = _exact(xs, T_END)
+    assert np.abs(grid.u - exact[:, None]).max() < 1e-3
+    assert np.abs(grid.u - grid.u[:, [0]]).max() < 1e-9
+
+
+def test_2d_crank_nicolson_convective_on_all_sides_reaches_u_inf():
+    n = 41
+    conv = Convective(h=50.0, u_inf=T_INF)
+    grid = Grid2D(0.2, 0.15, n, n, initial_temperature=np.full((n, n), T_I),
+                 k=K, rho_c=K / ALPHA)
+
+    run_crank_nicolson_2d(grid, 0.0, 1.0e5, boundary=(conv, conv), n_steps=4000)
+
+    assert grid.u == pytest.approx(T_INF, abs=1e-4)
+
+
+def test_2d_crank_nicolson_converges_to_explicit_with_convective_boundaries():
+    boundary = ((Convective(h=200.0, u_inf=T_INF), Dirichlet()), Neumann())
+    diffs = []
+    for n in (31, 61, 121):
+        def seeded():
+            return Grid2D(0.2, 0.12, n, n,
+                          initial_temperature=np.full((n, n), T_I),
+                          k=K, rho_c=K / ALPHA)
+
+        g_exp, g_cn = seeded(), seeded()
+        run_explicit_2d(g_exp, 0.0, 20.0, safety=0.9, boundary=boundary)
+        run_crank_nicolson_2d(g_cn, 0.0, 20.0, boundary=boundary, n_steps=8000)
+        diffs.append(np.abs(g_exp.u - g_cn.u).max())
+
+    orders = _convergence_orders(diffs)
+    assert all(o > 1.6 for o in orders), orders
+    assert diffs[-1] < 2e-2
+
+
+@pytest.mark.parametrize("h", [1e2, 1e3, 1e4, 1e5])
+def test_2d_corner_cells_are_stable_with_convection_on_both_axes(h):
+    n = 15
+    conv = Convective(h=h, u_inf=T_INF)
+    grid = Grid2D(0.2, 0.15, n, n, initial_temperature=np.full((n, n), T_I),
+                 k=K, rho_c=K / ALPHA)
+
+    dt = max_stable_dt_2d(grid, safety=0.9, boundary=(conv, conv))
+    for _ in range(300):
+        explicit_step_2d(grid, dt, boundary=(conv, conv))
+
+    assert np.all(np.isfinite(grid.u))
+    assert grid.u.max() <= T_INF + 1e-6
+    assert grid.u.min() >= T_I - 1e-6
+    for corner in (grid.u[0, 0], grid.u[0, -1], grid.u[-1, 0], grid.u[-1, -1]):
+        assert T_I - 1e-6 <= corner <= T_INF + 1e-6
+
+
+def test_2d_corner_reaches_u_inf_fastest_under_uniform_convection():
+    n = 21
+    conv = Convective(h=200.0, u_inf=T_INF)
+    grid = Grid2D(0.2, 0.15, n, n, initial_temperature=np.full((n, n), T_I),
+                 k=K, rho_c=K / ALPHA)
+
+    run_explicit_2d(grid, 0.0, 20.0, safety=0.9, boundary=(conv, conv))
+
+    mid = n // 2
+    assert grid.u[0, 0] > grid.u[0, mid]
+    assert grid.u[0, 0] > grid.u[mid, 0]
+    assert grid.u[0, 0] > grid.u[mid, mid]
