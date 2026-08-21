@@ -57,3 +57,19 @@ def uniform_boundary(boundary, context):
             f"{context} requires the same boundary condition on both sides "
             f"(got {left!r} and {right!r})")
     return left
+
+
+def normalize_boundary_2d(boundary, context):
+    if isinstance(boundary, tuple) and len(boundary) == 2:
+        x_spec, y_spec = boundary
+    else:
+        x_spec = y_spec = boundary
+    try:
+        x_left, x_right = normalize_boundary(x_spec)
+    except ValueError as exc:
+        raise ValueError(f"{context} (x-axis): {exc}") from None
+    try:
+        y_bottom, y_top = normalize_boundary(y_spec)
+    except ValueError as exc:
+        raise ValueError(f"{context} (y-axis): {exc}") from None
+    return x_left, x_right, y_bottom, y_top
