@@ -52,7 +52,16 @@ def test_2d_cache_key_includes_boundary():
     grid = Grid2D(1.0, 1.0, 21, 21, 0.01, 1.0)
     crank_nicolson_step_2d(grid, 1e-4)
     key = next(iter(grid._solver_cache))
-    assert Dirichlet() in key
+    assert (Dirichlet(), Dirichlet(), Dirichlet(), Dirichlet()) in key
+
+
+def test_2d_cache_distinguishes_different_boundaries():
+    grid = Grid2D(1.0, 1.0, 21, 21, 0.01, 1.0)
+    crank_nicolson_step_2d(grid, 1e-4, boundary="dirichlet")
+    crank_nicolson_step_2d(grid, 1e-4, boundary="neumann")
+    crank_nicolson_step_2d(grid, 1e-4, boundary=(Neumann(), Dirichlet()))
+
+    assert len(grid._solver_cache) == 3
 
 
 def test_equivalent_boundary_spellings_share_one_cache_entry():
