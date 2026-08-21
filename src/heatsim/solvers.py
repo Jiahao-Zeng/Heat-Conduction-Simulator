@@ -1,8 +1,8 @@
 import numpy as np
 
-from heatsim.grid import harmonic_face_mean, face_diffusivity  # re-exported
+from heatsim.grid import harmonic_face_mean, face_diffusivity
 from heatsim.boundary import (Dirichlet, Neumann, Convective,
-                              normalize_boundary, uniform_boundary)
+                              normalize_boundary, normalize_boundary_2d)
 
 _UNSET = object()
 
@@ -308,10 +308,35 @@ def run_crank_nicolson(grid, t_start, t_end, boundary="dirichlet",
     return _march(grid, crank_nicolson_step, n_steps, dt_used, boundary)
 
 
+def _axis_stable_rate(bc_lo, bc_hi, spacing, alpha_max,
+                       face_k_lo, face_k_hi, weight_lo, weight_hi,
+                       rho_c_lo, rho_c_hi):
+    rate = 2.0 * alpha_max / spacing ** 2
+    if isinstance(bc_lo, Convective) and bc_lo.h > 0.0:
+        rate = max(rate, (2.0 * face_k_lo + bc_lo.h * spacing)
+                   / (rho_c_lo * weight_lo * spacing ** 2))
+    if isinstance(bc_hi, Convective) and bc_hi.h > 0.0:
+        rate = max(rate, (2.0 * face_k_hi + bc_hi.h * spacing)
+                   / (rho_c_hi * weight_hi * spacing ** 2))
+    return rate
+
+
 def max_stable_dt_2d(grid, safety=0.9, boundary="dirichlet"):
-    normalize_boundary(boundary)
-    return safety / (2.0 * _max_diffusivity(grid)
-                     * (1.0 / grid.dx ** 2 + 1.0 / grid.dy ** 2))
+    x_lo, x_hi, y_lo, y_hi = normalize_boundary_2d(boundary, "max_stable_dt_2d")
+    alpha_max = _max_diffusivity(grid)
+
+    rate_x = _axis_stable_rate(
+        x_lo, x_hi, grid.dx, alpha_max,
+        float(grid.face_k_x[0, :].max()), float(grid.face_k_x[-1, :].max()),
+        float(grid.cell_weight_x[0, 0]), float(grid.cell_weight_x[-1, 0]),
+        float(grid.rho_c[0, :].min()), float(grid.rho_c[-1, :].min()))
+    rate_y = _axis_stable_rate(
+        y_lo, y_hi, grid.dy, alpha_max,
+        float(grid.face_k_y[:, 0].max()), float(grid.face_k_y[:, -1].max()),
+        float(grid.cell_weight_y[0, 0]), float(grid.cell_weight_y[0, -1]),
+        float(grid.rho_c[:, 0].min()), float(grid.rho_c[:, -1].min()))
+
+    return safety / (rate_x + rate_y)
 
 
 def _axis_divergence(face_k, u, spacing, axis):
@@ -323,23 +348,43 @@ def _axis_divergence(face_k, u, spacing, axis):
 def explicit_step_2d(grid, dt, boundary="dirichlet"):
     u = grid.u
     dx, dy = grid.dx, grid.dy
-    bc = uniform_boundary(boundary, "explicit_step_2d")
+    x_lo, x_hi, y_lo, y_hi = normalize_boundary_2d(boundary, "explicit_step_2d")
+    for bc in (x_lo, x_hi, y_lo, y_hi):
+        if not isinstance(bc, (Dirichlet, Neumann, Convective)):
+            raise ValueError(f"explicit_step_2d does not support {bc!r} yet")
 
-    if isinstance(bc, Dirichlet):
-        div_x = _axis_divergence(grid.face_k_x, u, dx, axis=0)
-        div_y = _axis_divergence(grid.face_k_y, u, dy, axis=1)
-        u[1:-1, 1:-1] += (dt * grid.inv_rho_c[1:-1, 1:-1]
-                          * (div_x[:, 1:-1] + div_y[1:-1, :]))
-    elif isinstance(bc, Neumann):
-        flux_x = grid.face_k_x * np.diff(u, axis=0) / dx
-        flux_y = grid.face_k_y * np.diff(u, axis=1) / dy
-        div = (np.diff(np.pad(flux_x, ((1, 1), (0, 0))), axis=0)
-               / (dx * grid.cell_weight_x)
-               + np.diff(np.pad(flux_y, ((0, 0), (1, 1))), axis=1)
-               / (dy * grid.cell_weight_y))
-        u += dt * grid.inv_rho_c * div
-    else:
-        raise ValueError(f"explicit_step_2d does not support {bc!r} yet")
+    flux_x = grid.face_k_x * np.diff(u, axis=0) / dx
+    div_x = np.empty_like(u)
+    div_x[1:-1, :] = np.diff(flux_x, axis=0)
+    div_x[0, :] = flux_x[0, :] + _explicit_boundary_term(x_lo, u[0, :])
+    div_x[-1, :] = -flux_x[-1, :] + _explicit_boundary_term(x_hi, u[-1, :])
+
+    flux_y = grid.face_k_y * np.diff(u, axis=1) / dy
+    div_y = np.empty_like(u)
+    div_y[:, 1:-1] = np.diff(flux_y, axis=1)
+    div_y[:, 0] = flux_y[:, 0] + _explicit_boundary_term(y_lo, u[:, 0])
+    div_y[:, -1] = -flux_y[:, -1] + _explicit_boundary_term(y_hi, u[:, -1])
+
+    delta = dt * grid.inv_rho_c * (div_x / (dx * grid.cell_weight_x)
+                                   + div_y / (dy * grid.cell_weight_y))
+
+    u[1:-1, 1:-1] += delta[1:-1, 1:-1]
+    if not isinstance(x_lo, Dirichlet):
+        u[0, 1:-1] += delta[0, 1:-1]
+    if not isinstance(x_hi, Dirichlet):
+        u[-1, 1:-1] += delta[-1, 1:-1]
+    if not isinstance(y_lo, Dirichlet):
+        u[1:-1, 0] += delta[1:-1, 0]
+    if not isinstance(y_hi, Dirichlet):
+        u[1:-1, -1] += delta[1:-1, -1]
+    if not isinstance(x_lo, Dirichlet) and not isinstance(y_lo, Dirichlet):
+        u[0, 0] += delta[0, 0]
+    if not isinstance(x_lo, Dirichlet) and not isinstance(y_hi, Dirichlet):
+        u[0, -1] += delta[0, -1]
+    if not isinstance(x_hi, Dirichlet) and not isinstance(y_lo, Dirichlet):
+        u[-1, 0] += delta[-1, 0]
+    if not isinstance(x_hi, Dirichlet) and not isinstance(y_hi, Dirichlet):
+        u[-1, -1] += delta[-1, -1]
 
     return u
 
@@ -351,58 +396,105 @@ def run_explicit_2d(grid, t_start, t_end, safety=_UNSET,
     return _march(grid, explicit_step_2d, n_steps, dt_used, boundary)
 
 
-def _adi_rates(face_k_along, inv_rho_c_interior, dt_half, spacing):
+def _cn2d_axis_rates(grid, dt_half, axis, bc_lo, bc_hi):
+    if axis == 0:
+        spacing, face, weight = grid.dx, grid.face_k_x, grid.cell_weight_x
+        pad = np.zeros((1, grid.ny))
+        padded = np.concatenate([pad, face, pad], axis=0)
+    else:
+        spacing, face, weight = grid.dy, grid.face_k_y, grid.cell_weight_y
+        pad = np.zeros((grid.nx, 1))
+        padded = np.concatenate([pad, face, pad], axis=1)
+
     scale = dt_half / spacing ** 2
-    return (scale * face_k_along[..., :-1] * inv_rho_c_interior,
-            scale * face_k_along[..., 1:] * inv_rho_c_interior)
+    inv = grid.inv_rho_c / weight
+    lo_slice = (slice(0, -1), slice(None)) if axis == 0 else (slice(None), slice(0, -1))
+    hi_slice = (slice(1, None), slice(None)) if axis == 0 else (slice(None), slice(1, None))
+    r_lo = scale * padded[lo_slice] * inv
+    r_hi = scale * padded[hi_slice] * inv
+    forcing = np.zeros_like(r_lo)
+
+    edge_lo = (0, slice(None)) if axis == 0 else (slice(None), 0)
+    edge_hi = (-1, slice(None)) if axis == 0 else (slice(None), -1)
+
+    if isinstance(bc_lo, Convective):
+        r_lo[edge_lo] = scale * bc_lo.h * spacing * inv[edge_lo]
+        forcing[edge_lo] = r_lo[edge_lo] * bc_lo.u_inf
+    elif isinstance(bc_lo, Dirichlet):
+        r_lo[edge_lo] = 0.0
+        r_hi[edge_lo] = 0.0
+
+    if isinstance(bc_hi, Convective):
+        r_hi[edge_hi] = scale * bc_hi.h * spacing * inv[edge_hi]
+        forcing[edge_hi] = r_hi[edge_hi] * bc_hi.u_inf
+    elif isinstance(bc_hi, Dirichlet):
+        r_lo[edge_hi] = 0.0
+        r_hi[edge_hi] = 0.0
+
+    if axis == 0:
+        return r_lo, r_hi, forcing
+    return r_lo, r_hi, forcing
+
+
+def _apply_axis_rates(u_along, r_lo, r_hi, forcing):
+    out = -(r_lo + r_hi) * u_along + forcing
+    out[..., 1:] += r_lo[..., 1:] * u_along[..., :-1]
+    out[..., :-1] += r_hi[..., :-1] * u_along[..., 1:]
+    return out
+
+
+def _cn2d_fixed_mask(grid, x_lo, x_hi, y_lo, y_hi):
+    mask = np.zeros((grid.nx, grid.ny), dtype=bool)
+    if isinstance(x_lo, Dirichlet):
+        mask[0, :] = True
+    if isinstance(x_hi, Dirichlet):
+        mask[-1, :] = True
+    if isinstance(y_lo, Dirichlet):
+        mask[:, 0] = True
+    if isinstance(y_hi, Dirichlet):
+        mask[:, -1] = True
+    return mask
 
 
 def crank_nicolson_step_2d(grid, dt, boundary="dirichlet"):
-    bc = uniform_boundary(boundary, "crank_nicolson_step_2d")
-    if not isinstance(bc, Dirichlet):
-        raise ValueError(
-            f"crank_nicolson_step_2d only supports Dirichlet boundaries "
-            f"(got {bc!r})")
+    sides = normalize_boundary_2d(boundary, "crank_nicolson_step_2d")
+    x_lo, x_hi, y_lo, y_hi = sides
+    for bc in sides:
+        if not isinstance(bc, (Dirichlet, Neumann, Convective)):
+            raise ValueError(f"crank_nicolson_step_2d does not support {bc!r} yet")
 
     u = grid.u
-    dx, dy = grid.dx, grid.dy
     dt_half = dt / 2.0
 
-    key = ("cn2d", float(dt), bc)
+    key = ("cn2d", float(dt), sides)
     cached = grid._solver_cache.get(key)
     if cached is None:
-        inv_rho_c_int = grid.inv_rho_c[1:-1, 1:-1]
-        rate_x = _adi_rates(
-            np.moveaxis(grid.face_k_x, 0, -1)[1:-1, :],
-            np.moveaxis(inv_rho_c_int, 0, -1), dt_half, dx)
-        rate_y = _adi_rates(
-            grid.face_k_y[1:-1, :], inv_rho_c_int, dt_half, dy)
+        rx = _cn2d_axis_rates(grid, dt_half, 0, x_lo, x_hi)
+        ry = _cn2d_axis_rates(grid, dt_half, 1, y_lo, y_hi)
+        rx_moved = tuple(np.moveaxis(a, 0, -1) for a in rx)
         cached = grid._cache_solver(key, (
-            tridiagonal_factor(*_tridiagonal_from_rates(*rate_x)), rate_x,
-            tridiagonal_factor(*_tridiagonal_from_rates(*rate_y)), rate_y))
-    factors_x, (rlx, rrx), factors_y, (rly, rry) = cached
+            tridiagonal_factor(*_tridiagonal_from_rates(
+                rx_moved[0], rx_moved[1])), rx, rx_moved,
+            tridiagonal_factor(*_tridiagonal_from_rates(ry[0], ry[1])), ry,
+            _cn2d_fixed_mask(grid, x_lo, x_hi, y_lo, y_hi)))
+    factors_x, (rlx, rrx, fx), rx_moved, factors_y, (rly, rry, fy), fixed = cached
 
-    ly_un = _axis_divergence(grid.face_k_y, u, dy, axis=1)
-    u_row = np.moveaxis(u, 0, -1)
-    ly_row = np.moveaxis(ly_un, 0, -1)
+    original = u.copy()
 
-    rhs_x = (u_row[1:-1, 1:-1]
-             + dt_half * np.moveaxis(grid.inv_rho_c, 0, -1)[1:-1, 1:-1]
-             * ly_row[:, 1:-1])
-    rhs_x[:, 0] += rlx[:, 0] * u_row[1:-1, 0]
-    rhs_x[:, -1] += rrx[:, -1] * u_row[1:-1, -1]
+    y_explicit = _apply_axis_rates(u, rly, rry, fy)
+    rhs_x = u + y_explicit + fx
+    rhs_x[fixed] = original[fixed]
+    u_star = np.moveaxis(
+        tridiagonal_solve(factors_x, np.moveaxis(rhs_x, 0, -1)), -1, 0)
+    u_star[fixed] = original[fixed]
 
-    u_star = u.copy()
-    u_star[1:-1, 1:-1] = np.moveaxis(tridiagonal_solve(factors_x, rhs_x), -1, 0)
+    x_explicit = np.moveaxis(
+        _apply_axis_rates(np.moveaxis(u_star, 0, -1), *rx_moved), -1, 0)
+    rhs_y = u_star + x_explicit + fy
+    rhs_y[fixed] = original[fixed]
+    u[:] = tridiagonal_solve(factors_y, rhs_y)
+    u[fixed] = original[fixed]
 
-    lx_star = _axis_divergence(grid.face_k_x, u_star, dx, axis=0)
-
-    rhs_y = (u_star[1:-1, 1:-1]
-             + dt_half * grid.inv_rho_c[1:-1, 1:-1] * lx_star[:, 1:-1])
-    rhs_y[:, 0] += rly[:, 0] * u_star[1:-1, 0]
-    rhs_y[:, -1] += rry[:, -1] * u_star[1:-1, -1]
-
-    u[1:-1, 1:-1] = tridiagonal_solve(factors_y, rhs_y)
     return u
 
 
