@@ -133,10 +133,14 @@ def test_crank_nicolson_stable_well_past_explicit_cfl_limit():
     assert np.abs(grid.u).max() < 10 * peak_before
 
 
-def test_crank_nicolson_rejects_neumann():
+def test_crank_nicolson_2d_conserves_heat_with_insulated_boundaries():
     grid = _seeded_grid(21)
-    with pytest.raises(ValueError):
+    before = grid.total_heat()
+
+    for _ in range(50):
         crank_nicolson_step_2d(grid, 1e-4, boundary="neumann")
+
+    assert grid.total_heat() == pytest.approx(before, rel=1e-12)
 
 
 def test_1d_solvers_are_unaffected():
@@ -356,3 +360,20 @@ def test_each_edge_of_the_harmonic_field_carries_distinct_values():
         assert edge.max() - edge.min() > 1.0
     means = sorted(float(e.mean()) for e in edges)
     assert all(b - a > 0.5 for a, b in zip(means, means[1:]))
+
+def test_crank_nicolson_2d_neumann_is_second_order_accurate():
+    alpha, t_end = 1.0e-2, 0.5
+    errors = []
+    for scale in (1, 2, 4):
+        nx, ny = 20 * scale + 1, 32 * scale + 1
+        X, Y = _rect_mesh(nx, ny)
+        grid = Grid2D(LX_RECT, LY_RECT, nx, ny,
+                      initial_temperature=_rect_neumann_mode(X, Y, 0.0, alpha),
+                      k=0.6, rho_c=0.6 / alpha)
+        run_crank_nicolson_2d(grid, 0.0, t_end, boundary="neumann",
+                              n_steps=2000)
+        exact = _rect_neumann_mode(X, Y, t_end, alpha)
+        errors.append(np.sqrt(np.mean((grid.u - exact) ** 2)))
+
+    orders = [np.log2(errors[i] / errors[i + 1]) for i in range(len(errors) - 1)]
+    assert all(o > 1.85 for o in orders), orders
